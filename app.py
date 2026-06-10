@@ -1,336 +1,720 @@
-!pip install -q langchain langchain-groq yfinance ta matplotlib
-!pip install -U langchain langchain-community langchain-core
-import os
-import yfinance as yf
-import pandas as pd
-import ta
-import matplotlib.pyplot as plt
-
-from IPython.display import display
-from langchain.agents import create_agent
-from langchain_core.tools import tool
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
 
-@tool
-def analyze_stock(symbol: str) -> str:
-    """
-    Complete Technical Analysis Engine with Signals and Risk Classification
-    """
+print("✅ Environment Ready")
 
-    import numpy as np
+import os
+import sqlite3
+import time
+import warnings
+from datetime import datetime
 
-    symbol = symbol.upper().strip()
+import pandas as pd
+import numpy as np
 
-    stock = yf.Ticker(symbol)
-    data = stock.history(period="6mo")
+import yfinance as yf
+import ta
 
-    # ==========================
-    # FUNDAMENTAL DATA
-    # ==========================
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-    info = stock.info
+import matplotlib.pyplot as plt
 
-    pe_ratio = info.get("trailingPE", "N/A")
-    market_cap = info.get("marketCap", "N/A")
-    eps = info.get("trailingEps", "N/A")
+warnings.filterwarnings("ignore")
 
-    if isinstance(market_cap, (int, float)):
-      market_cap = f"{market_cap/1e9:.2f} Billion"
+print("Pandas :", pd.__version__)
+print("Numpy  :", np.__version__)
+print("YFinance Loaded")
+print("TA Loaded")
+print("VADER Loaded")
+print("✅ Core Libraries Ready")
 
-    if data.empty and not symbol.endswith(".NS"):
-        symbol_ns = symbol + ".NS"
-        stock = yf.Ticker(symbol_ns)
-        data = stock.history(period="6mo")
-        symbol = symbol_ns
 
-    if data.empty:
-        return f"No stock data found for {symbol}"
+import os
 
-    # ==========================
-    # INDICATORS
-    # ==========================
+from dotenv import load_dotenv
+load_dotenv()
 
-    data["RSI"] = ta.momentum.RSIIndicator(data["Close"]).rsi()
-    data["MA50"] = data["Close"].rolling(50).mean()
-    data["MA200"] = data["Close"].rolling(200).mean()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-    macd = ta.trend.MACD(data["Close"])
-    data["MACD"] = macd.macd()
-    data["MACD_SIGNAL"] = macd.macd_signal()
+DB_PATH = "financial_agent.db"
 
-    latest = data.iloc[-1]
+def init_database():
 
-    rsi = latest["RSI"]
-    ma50 = latest["MA50"]
-    ma200 = latest["MA200"]
-    macd_val = latest["MACD"]
-    macd_signal = latest["MACD_SIGNAL"]
+    conn = sqlite3.connect(DB_PATH)
 
-    # ==========================
-    # SIGNAL LOGIC
-    # ==========================
+    cur = conn.cursor()
 
-    signal = "HOLD"
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS portfolio(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT,
+        quantity REAL,
+        avg_price REAL,
+        added_date TEXT
+    )
+    """)
 
-    if rsi < 30 and ma50 > ma200:
-        signal = "BUY"
-    elif rsi > 70 and ma50 < ma200:
-        signal = "SELL"
-    elif ma50 > ma200:
-        signal = "BULLISH HOLD"
-    elif ma50 < ma200:
-        signal = "BEARISH HOLD"
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS analysis_history(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT,
+        analysis_date TEXT,
+        signal TEXT,
+        price REAL,
+        rsi REAL
+    )
+    """)
 
-    # ==========================
-    # RISK SCORE
-    # ==========================
+    conn.commit()
+    conn.close()
 
-    volatility = data["Close"].pct_change().std()
+    print("✅ Database Created")
 
-    if volatility < 0.01:
-        risk = "Low Risk"
-    elif volatility < 0.025:
-        risk = "Moderate Risk"
-    else:
-        risk = "High Risk"
+init_database()
 
-    # ==========================
-    # VISUALIZATION
-    # ==========================
+COMPANY_SYMBOL_MAP = {
 
-    # Price + MA
-    plt.figure(figsize=(12,6))
-    plt.plot(data["Close"], label="Close Price")
-    plt.plot(data["MA50"], label="MA50")
-    plt.plot(data["MA200"], label="MA200")
-    plt.legend()
-    plt.title(f"{symbol} Price with Moving Averages")
-    plt.grid()
-    plt.show()
+    "INFOSYS":"INFY.NS",
+    "INFY":"INFY.NS",
 
-    # RSI
-    plt.figure(figsize=(12,4))
-    plt.plot(data["RSI"])
-    plt.axhline(70, linestyle="--")
-    plt.axhline(30, linestyle="--")
-    plt.title("RSI Indicator")
-    plt.grid()
-    plt.show()
+    "TCS":"TCS.NS",
 
-    # MACD
-    plt.figure(figsize=(12,4))
-    plt.plot(data["MACD"], label="MACD")
-    plt.plot(data["MACD_SIGNAL"], label="Signal Line")
-    plt.legend()
-    plt.title("MACD Indicator")
-    plt.grid()
-    plt.show()
+    "RELIANCE":"RELIANCE.NS",
 
-    display(data.tail())
+    "HDFC":"HDFCBANK.NS",
+
+    "ICICI":"ICICIBANK.NS",
+
+    "WIPRO":"WIPRO.NS",
+
+    "AAPL":"AAPL",
+    "APPLE":"AAPL",
+
+    "MSFT":"MSFT",
+    "MICROSOFT":"MSFT",
+
+    "TSLA":"TSLA",
+    "TESLA":"TSLA",
+
+    "NVDA":"NVDA",
+    "NVIDIA":"NVDA"
+}
+
+def resolve_symbol(user_input):
+
+    key = user_input.upper().strip()
+
+    if key in COMPANY_SYMBOL_MAP:
+        return COMPANY_SYMBOL_MAP[key]
+
+    return key
+
+print("✅ Symbol Resolver Ready")
+
+print(resolve_symbol("Infosys"))
+print(resolve_symbol("Tesla"))
+print(resolve_symbol("TCS"))
+
+def analyze_stock(symbol):
+
+    symbol = resolve_symbol(symbol)
+
+    try:
+
+        stock = yf.Ticker(symbol)
+
+        data = stock.history(period="1y")
+
+        if data.empty:
+            return {
+                "text": f"No data found for {symbol}",
+                "image": None
+            }
+
+        data["RSI"] = ta.momentum.RSIIndicator(
+            data["Close"],
+            window=14
+        ).rsi()
+
+        data["MA20"] = data["Close"].rolling(20).mean()
+        data["MA50"] = data["Close"].rolling(50).mean()
+        data["MA200"] = data["Close"].rolling(200).mean()
+
+        latest = data.dropna().iloc[-1]
+
+        price = round(latest["Close"], 2)
+        rsi = round(latest["RSI"], 2)
+
+        ma20 = round(latest["MA20"], 2)
+        ma50 = round(latest["MA50"], 2)
+        ma200 = round(latest["MA200"], 2)
+
+        if rsi < 30:
+            signal = "BUY"
+
+        elif rsi > 70:
+            signal = "SELL"
+
+        else:
+            signal = "HOLD"
+
+        chart_path = f"{symbol.replace('.','_')}.png"
+
+        plt.figure(figsize=(12,6))
+
+        plt.plot(data.index, data["Close"], label="Price")
+        plt.plot(data.index, data["MA20"], label="MA20")
+        plt.plot(data.index, data["MA50"], label="MA50")
+
+        plt.legend()
+
+        plt.title(symbol)
+
+        plt.savefig(chart_path)
+
+        plt.close()
+
+        text = f"""
+Stock Analysis Report
+
+Symbol : {symbol}
+
+Current Price : {price}
+
+RSI : {rsi}
+
+MA20 : {ma20}
+MA50 : {ma50}
+MA200 : {ma200}
+
+Signal : {signal}
+"""
+
+        return {
+            "text": text,
+            "image": chart_path
+        }
+
+    except Exception as e:
+
+        return {
+            "text": str(e),
+            "image": None
+        }
+
+print("✅ Stock Analysis Ready")
+
+result = analyze_stock("TCS")
+
+print(result["text"])
+print(result["image"])
+
+def news_sentiment(symbol):
+
+    symbol = resolve_symbol(symbol)
+
+    analyzer = SentimentIntensityAnalyzer()
+
+    ticker = yf.Ticker(symbol)
+
+    try:
+        news = ticker.news
+    except:
+        return "Unable to fetch news"
+
+    if not news:
+        return "No recent news available"
+
+    output = []
+
+    scores = []
+
+    for item in news[:10]:
+
+        try:
+
+            title = item.get("title","")
+
+            sentiment = analyzer.polarity_scores(title)
+
+            compound = sentiment["compound"]
+
+            scores.append(compound)
+
+            if compound > 0.05:
+                label = "Positive"
+
+            elif compound < -0.05:
+                label = "Negative"
+
+            else:
+                label = "Neutral"
+
+            output.append(
+                f"{label} | {compound:.2f}\n{title}\n"
+            )
+
+        except:
+            pass
+
+    if scores:
+
+        avg = sum(scores)/len(scores)
+
+        if avg > 0.05:
+            overall = "Bullish"
+
+        elif avg < -0.05:
+            overall = "Bearish"
+
+        else:
+            overall = "Neutral"
+
+        output.append(
+            f"\nOverall Sentiment: {overall}"
+        )
+
+    return "\n".join(output)
+
+print("✅ News Sentiment Ready")
+
+print(
+    news_sentiment("INFY")
+)
+
+def compare_stocks(stock_list):
+
+    symbols = [
+        resolve_symbol(x.strip())
+        for x in stock_list.split(",")
+    ]
+
+    output = []
+
+    output.append("STOCK COMPARISON")
+    output.append("=" * 60)
+
+    for symbol in symbols:
+
+        try:
+
+            stock = yf.Ticker(symbol)
+
+            hist = stock.history(period="3mo")
+
+            if hist.empty:
+                continue
+
+            info = stock.info
+
+            price = round(
+                hist["Close"].iloc[-1],
+                2
+            )
+
+            pe = info.get(
+                "trailingPE",
+                "N/A"
+            )
+
+            eps = info.get(
+                "trailingEps",
+                "N/A"
+            )
+
+            rsi = ta.momentum.RSIIndicator(
+                hist["Close"],
+                window=14
+            ).rsi().iloc[-1]
+
+            output.append(
+f"""
+Symbol : {symbol}
+Price  : {price}
+PE     : {pe}
+EPS    : {eps}
+RSI    : {rsi:.2f}
+"""
+            )
+
+        except Exception as e:
+
+            output.append(
+                f"{symbol} : {e}"
+            )
+
+    return "\n".join(output)
+
+print("✅ Compare Stocks Ready")
+
+print(
+    compare_stocks(
+        "INFY,TCS,WIPRO"
+    )
+)
+
+def sip_calculator(monthly_amount, years, annual_return):
+
+    monthly_rate = annual_return / 12 / 100
+
+    months = years * 12
+
+    future_value = monthly_amount * (
+        ((1 + monthly_rate) ** months - 1)
+        / monthly_rate
+    ) * (1 + monthly_rate)
+
+    invested = monthly_amount * months
+
+    gains = future_value - invested
 
     return f"""
-Stock: {symbol}
-Current Price: {latest['Close']:.2f}
+SIP REPORT
+================================
 
---- Technical Indicators ---
-RSI: {rsi:.2f}
-MA50: {ma50:.2f}
-MA200: {ma200:.2f}
-MACD: {macd_val:.2f}
-MACD Signal: {macd_signal:.2f}
+Monthly Investment : ₹{monthly_amount:,.0f}
 
-Signal: {signal}
-Risk Level: {risk}
+Years              : {years}
 
---- Fundamental Analysis ---
-PE Ratio: {pe_ratio}
-EPS: {eps}
-Market Cap: {market_cap}
+Expected Return    : {annual_return}%
+
+Total Invested     : ₹{invested:,.0f}
+
+Future Value       : ₹{future_value:,.0f}
+
+Estimated Profit   : ₹{gains:,.0f}
 """
+
+print("✅ SIP Calculator Ready")
+
+print(
+    sip_calculator(
+        5000,
+        10,
+        12
+    )
+)
+
+def portfolio_add(symbol, qty, price):
+
+    conn = sqlite3.connect(DB_PATH)
+
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT INTO portfolio
+        (symbol, quantity, avg_price, added_date)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            resolve_symbol(symbol),
+            qty,
+            price,
+            datetime.now().isoformat()
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+    return "Added Successfully"
+
+
+def portfolio_view():
+
+    conn = sqlite3.connect(DB_PATH)
+
+    cur = conn.cursor()
+
+    rows = cur.execute(
+        """
+        SELECT symbol,
+               quantity,
+               avg_price
+        FROM portfolio
+        """
+    ).fetchall()
+
+    conn.close()
+
+    if not rows:
+        return "Portfolio Empty"
+
+    output = []
+
+    total_invested = 0
+    total_value = 0
+
+    for symbol, qty, avg_price in rows:
+
+        try:
+
+            stock = yf.Ticker(symbol)
+
+            hist = stock.history(period="5d")
+
+            current_price = round(
+                hist["Close"].iloc[-1],
+                2
+            )
+
+            invested = qty * avg_price
+
+            current_value = qty * current_price
+
+            pnl = current_value - invested
+
+            total_invested += invested
+            total_value += current_value
+
+            output.append(
+f"""
+{symbol}
+
+Qty : {qty}
+
+Buy : {avg_price}
+
+Current : {current_price}
+
+PnL : {round(pnl,2)}
+"""
+            )
+
+        except Exception as e:
+
+            output.append(
+                f"{symbol} Error {e}"
+            )
+
+    output.append(
+f"""
+
+========================
+
+Total Invested : {round(total_invested,2)}
+
+Current Value  : {round(total_value,2)}
+
+Net PnL        : {round(total_value-total_invested,2)}
+"""
+    )
+
+    return "\n".join(output)
+
+print("✅ Portfolio Ready")
+
+print(
+    portfolio_add(
+        "INFY",
+        10,
+        1500
+    )
+)
+
+print(
+    portfolio_view()
+)
+
+def market_overview():
+
+    indices = {
+        "NIFTY50":"^NSEI",
+        "SENSEX":"^BSESN",
+        "NASDAQ":"^IXIC",
+        "S&P500":"^GSPC"
+    }
+
+    output = []
+
+    output.append(
+        "MARKET OVERVIEW"
+    )
+
+    output.append(
+        "=" * 50
+    )
+
+    for name, ticker in indices.items():
+
+        try:
+
+            hist = yf.Ticker(
+                ticker
+            ).history(period="5d")
+
+            current = hist["Close"].iloc[-1]
+
+            previous = hist["Close"].iloc[-2]
+
+            change = current - previous
+
+            pct = (
+                change / previous
+            ) * 100
+
+            output.append(
+                f"{name} : {current:.2f} ({pct:.2f}%)"
+            )
+
+        except:
+
+            output.append(
+                f"{name} unavailable"
+            )
+
+    return "\n".join(output)
+
+print("✅ Market Overview Ready")
+
+print(
+    market_overview()
+)
+
+from langchain_groq import ChatGroq
 
 llm = ChatGroq(
     model="llama-3.1-8b-instant",
-    temperature=0
+    temperature=0.1
 )
 
-tools = [analyze_stock]
+print("✅ Groq LLM Ready")
 
-system_prompt = """
-You are a professional equity research analyst.
+def ask_finagent(question):
 
-When analyzing a stock:
+    prompt = f"""
+You are FinSage.
 
-1. Explain technical indicators clearly.
-2. Interpret RSI (overbought/oversold).
-3. Explain moving average trend.
-4. Interpret PE ratio (valuation insight).
-5. Explain market cap category (Large/Mid/Small Cap).
-6. If advice is requested, provide:
-   - Short-term outlook
-   - Long-term outlook
-7. Keep explanation structured and professional.
+You are a financial research assistant.
+
+Answer professionally.
+
+Question:
+
+{question}
 """
-agent = create_agent(
-    model=llm,
-    tools=tools,
-    system_prompt=system_prompt
+
+    response = llm.invoke(prompt)
+
+    return response.content
+
+print("✅ AI Chat Ready")
+
+print(
+    ask_finagent(
+        "What is RSI in stock market?"
+    )
 )
 
-company_symbol_map = {
-    "INFOSYS": "INFY",
-    "TCS": "TCS",
-    "RELIANCE": "RELIANCE",
-    "HDFC": "HDFCBANK",
-    "HDFC BANK": "HDFCBANK",
-    "APPLE": "AAPL",
-    "MICROSOFT": "MSFT",
-    "GOOGLE": "GOOGL",
-    "ALPHABET": "GOOGL",
-    "CAPGEMINI": "CAP",
-    "WELLS FARGO": "WFC",
-    "TESLA": "TSLA"
-}
+import gradio as gr
 
-import yfinance as yf
+def ui_stock(symbol):
 
-def get_ticker_from_name(company_name):
-    try:
-        search = yf.Search(company_name)
-        results = search.quotes
+    result = analyze_stock(symbol)
 
-        if not results:
-            return None
+    return result["text"], result["image"]
 
-        # Return first matching ticker
-        return results[0]['symbol']
 
-    except Exception as e:
-        print("Ticker search failed:", e)
-        return None
+def ui_news(symbol):
 
-portfolio = {}
+    return news_sentiment(symbol)
 
-import re
 
-while True:
-    user_input = input("\nEnter command: ")
+def ui_compare(symbols):
 
-    if user_input.lower() == "exit":
-        print("Goodbye 👋")
-        break
+    return compare_stocks(symbols)
 
-    # ==========================
-    # 📌 ADD STOCK TO PORTFOLIO
-    # ==========================
-    if user_input.lower().startswith("add"):
-        parts = user_input.split()
 
-        if len(parts) == 4:
-            stock_symbol = parts[1].upper()
-            quantity = int(parts[2])
-            buy_price = float(parts[3])
+def ui_market():
 
-            if stock_symbol in portfolio:
-                old_qty = portfolio[stock_symbol]["quantity"]
-                old_price = portfolio[stock_symbol]["avg_price"]
+    return market_overview()
 
-                new_qty = old_qty + quantity
-                new_avg = ((old_qty * old_price) + (quantity * buy_price)) / new_qty
 
-                portfolio[stock_symbol]["quantity"] = new_qty
-                portfolio[stock_symbol]["avg_price"] = new_avg
-            else:
-                portfolio[stock_symbol] = {
-                    "quantity": quantity,
-                    "avg_price": buy_price
-                }
+def ui_ai(question):
 
-            print(f"✅ Added {quantity} shares of {stock_symbol} at {buy_price}")
-        else:
-            print("Usage: add TICKER quantity buy_price")
+    return ask_finagent(question)
 
-        continue
+print("✅ UI Functions Ready")
 
-    # ==========================
-    # 📊 VIEW PORTFOLIO
-    # ==========================
-    if user_input.lower() == "portfolio":
+with gr.Blocks() as demo:
 
-        if not portfolio:
-            print("⚠ Portfolio is empty.")
-            continue
+    gr.Markdown("# FinSage Financial Research AI")
 
-        print("\n========= YOUR PORTFOLIO =========")
+    with gr.Tab("Stock Analysis"):
 
-        total_value = 0
-        total_invested = 0
+        stock_input = gr.Textbox()
 
-        for sym, data in portfolio.items():
-            qty = data["quantity"]
-            avg_price = data["avg_price"]
+        stock_btn = gr.Button("Analyze")
 
-            stock = yf.Ticker(sym)
-            hist = stock.history(period="5d")
+        stock_text = gr.Textbox(lines=20)
 
-            if hist.empty:
-                print(f"{sym} - No data available")
-                continue
+        stock_img = gr.Image()
 
-            current_price = hist["Close"].iloc[-1]
+        stock_btn.click(
+            ui_stock,
+            stock_input,
+            [stock_text, stock_img]
+        )
 
-            invested = qty * avg_price
-            current_value = qty * current_price
-            profit_loss = current_value - invested
-            profit_percent = (profit_loss / invested) * 100
+    with gr.Tab("News Sentiment"):
 
-            total_value += current_value
-            total_invested += invested
+        news_input = gr.Textbox()
 
-            print(f"\n📌 {sym}")
-            print(f"  Shares: {qty}")
-            print(f"  Avg Buy Price: {avg_price:.2f}")
-            print(f"  Current Price: {current_price:.2f}")
-            print(f"  Invested: {invested:.2f}")
-            print(f"  Current Value: {current_value:.2f}")
-            print(f"  Profit/Loss: {profit_loss:.2f} ({profit_percent:.2f}%)")
-            print("-----------------------------------")
+        news_btn = gr.Button("Analyze")
 
-        total_profit = total_value - total_invested
+        news_output = gr.Textbox(lines=20)
 
-        print("\n========== SUMMARY ==========")
-        print(f"Total Invested: {total_invested:.2f}")
-        print(f"Total Current Value: {total_value:.2f}")
-        print(f"Total Profit/Loss: {total_profit:.2f}")
-        print("=============================\n")
+        news_btn.click(
+            ui_news,
+            news_input,
+            news_output
+        )
 
-        continue
+    with gr.Tab("Compare"):
 
-    # ==========================
-    # 📈 STOCK ANALYSIS
-    # ==========================
-    upper_input = user_input.upper()
+        compare_input = gr.Textbox()
 
-    symbol = company_symbol_map.get(upper_input, upper_input)
+        compare_btn = gr.Button("Compare")
 
-    stock = yf.Ticker(symbol)
-    hist = stock.history(period="5d")
+        compare_output = gr.Textbox(lines=20)
 
-    if hist.empty:
-        print("❌ Stock not found.")
-        continue
+        compare_btn.click(
+            ui_compare,
+            compare_input,
+            compare_output
+        )
 
-    current_price = hist["Close"].iloc[-1]
-    info = stock.info
+    with gr.Tab("Market"):
 
-    pe_ratio = info.get("trailingPE", "N/A")
-    market_cap = info.get("marketCap", "N/A")
-    eps = info.get("trailingEps", "N/A")
+        market_btn = gr.Button(
+            "Refresh"
+        )
 
-    print("\n========= STOCK ANALYSIS =========")
-    print(f"Company: {symbol}")
-    print(f"Current Price: {current_price:.2f}")
-    print(f"PE Ratio: {pe_ratio}")
-    print(f"EPS: {eps}")
-    print(f"Market Cap: {market_cap}")
-    print("==================================")
+        market_output = gr.Textbox(
+            lines=20
+        )
+
+        market_btn.click(
+            ui_market,
+            outputs=market_output
+        )
+
+    with gr.Tab("AI Chat"):
+
+        ai_input = gr.Textbox()
+
+        ai_btn = gr.Button("Ask")
+
+        ai_output = gr.Textbox(
+            lines=20
+        )
+
+        ai_btn.click(
+            ui_ai,
+            ai_input,
+            ai_output
+        )
+
+demo.launch(
+    share=True
+)
